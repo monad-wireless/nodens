@@ -1,0 +1,50 @@
+name: Bug report
+description: Something does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. Please remove real hostnames, addresses,
+        usernames and keys from anything you paste.
+        For a security problem, use Security → Report a vulnerability instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you saw.
+    validations:
+      required: true
+  - type: dropdown
+    id: driver
+    attributes:
+      label: Profile type
+      options:
+        - OpenVPN
+        - WireGuard
+        - Tailscale only
+        - Not related to a profile
+    validations:
+      required: true
+  - type: dropdown
+    id: route
+    attributes:
+      label: Route fix (Settings → Tailscale under a full-tunnel VPN)
+      options:
+        - Host routes
+        - Scoped default
+        - Scoped halves
+        - "Off"
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Nodens commit or version, macOS version, Tailscale version, openvpn or wireguard-tools version.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant lines of /Library/Logs/Nodens/<profile>.log, with private values removed.
+      render: text

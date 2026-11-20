@@ -1,0 +1,16 @@
+name: Feature request
+description: An idea for Nodens.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What do you want to do that Nodens does not support today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: How could Nodens solve it? A new VPN engine? Then name the open-source engine it would drive.

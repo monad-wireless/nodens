@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: swift --version
+
+      - name: Hook checks and unit tests
+        run: make test
+
+      - name: Build the app bundle
+        run: make app
+
+      # A tarball keeps the executable bits that a zipped folder would lose.
+      - name: Pack the app bundle
+        run: tar -czf build/Nodens.app.tar.gz -C build Nodens.app
+
+      - name: Upload the app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nodens.app
+          path: build/Nodens.app.tar.gz
+          retention-days: 7

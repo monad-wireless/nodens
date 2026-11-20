@@ -1,0 +1,324 @@
+#!/bin/sh
+# nodens-hook: the only code Nodens runs as root, apart from the VPN engines
+# (openvpn, wg-quick). Installed to /usr/local/libexec/nodens/hook on every
+# admin action.
+#
+# It records every change under $STATE and can undo all of them, also after a
+# reboot or a crashed engine. It is the single owner of the /etc/resolver files
+# Nodens needs.
+#
+#   ovpn-up                        openvpn --route-up (env: dev, foreign_option_N,
+#                                  dns_*, NODENS_SLUG, NODENS_ROUTE_STRATEGY)
+#   ovpn-down                      openvpn --route-pre-down: undo this tunnel
+#   wg-up <slug> <utun>            wg-quick PostUp (env: NODENS_ROUTE_STRATEGY,
+#                                  NODENS_DNS_SERVERS, NODENS_DNS_DOMAINS)
+#   wg-down <slug>                 wg-quick PreDown: undo this tunnel
+#   undo <slug>                    undo every recorded change of one tunnel
+#   cleanup-stale                  undo every tunnel whose engine no longer runs
+#   resolver-apply <owner> <file>  write /etc/resolver files; lines "domain ns [ns...]"
+#   resolver-clear <owner>         remove every file of one owner
+#
+# Dry run (no root needed): NODENS_DRY_RUN=1 prints route and networksetup
+# commands instead of running them. Point NODENS_STATE_DIR, NODENS_RESOLVER_DIR
+# and NODENS_WG_RUN_DIR at scratch directories; NODENS_ETC_DIR holds the hosts
+# files; NODENS_ASSUME_FULL=1 treats the tunnel as full.
+#
+# SPDX-License-Identifier: MIT
+
+set -u
+set -f # pushed options are split into words; never expand them as globs
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+umask 022
+
+STATE="${NODENS_STATE_DIR:-/usr/local/var/nodens}"
+ETC="${NODENS_ETC_DIR:-/usr/local/etc/nodens}"
+RESOLVER_DIR="${NODENS_RESOLVER_DIR:-/etc/resolver}"
+WG_RUN="${NODENS_WG_RUN_DIR:-/var/run/wireguard}"
+REGISTRY="$STATE/resolver"
+TUNNELS="$STATE/tunnels"
+DRY="${NODENS_DRY_RUN:-0}"
+
+say() { echo "nodens-hook: $*"; }
+
+# Runs a system-changing command, or prints it in a dry run.
+run() {
+    if [ "$DRY" = 1 ]; then
+        echo "+ $*"
+        return 0
+    fi
+    out=$("$@" 2>&1)
+    rc=$?
+    [ -z "$out" ] || say "$*: $out"
+    return $rc
+}
+
+valid_slug() { case "$1" in '' | *[!a-z0-9-]*) return 1 ;; esac; return 0; }
+valid_owner() { case "$1" in tailnet) return 0 ;; tunnel:*) valid_slug "${1#tunnel:}" ;; *) return 1 ;; esac; }
+valid_device() { case "$1" in utun*[!0-9]* | utun) return 1 ;; utun*) return 0 ;; esac; return 1; }
+valid_domain() {
+    case "$1" in
+    '' | *[!a-z0-9.-]* | .* | *. | *..*) return 1 ;;
+    *.*) return 0 ;;
+    esac
+    return 1
+}
+valid_ip() { case "$1" in '' | *[!0-9a-fA-F:.]*) return 1 ;; esac; return 0; }
+lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
+
+# "<interface> <gateway>" of the unscoped IPv4 default route that is not a tunnel.
+uplink() {
+    netstat -rn -f inet | awk '$1 == "default" && $3 !~ /I/ && $4 !~ /^(utun|ipsec|ppp)/ && $2 ~ /^[0-9.]+$/ { print $4, $2; exit }'
+}
+
+# True when the tunnel holds 0/1 (openvpn's def1, wg-quick's 0.0.0.0/0).
+full_tunnel() {
+    [ "${NODENS_ASSUME_FULL:-0}" = 1 ] && return 0
+    netstat -rn -f inet | awk -v d="$1" '($1 == "0/1" || $1 == "0.0.0.0/1") && $4 == d { f = 1 } END { exit f ? 0 : 1 }'
+}
+
+ipv6_full_tunnel() {
+    netstat -rn -f inet6 | awk -v d="$1" '$1 == "::/1" && $4 == d { f = 1 } END { exit f ? 0 : 1 }'
+}
+
+# Network service name of a BSD device, e.g. en0 -> Wi-Fi.
+service_for() {
+    networksetup -listnetworkserviceorder | awk -v dev="$1" '
+        /^\([0-9*]+\) / { name = $0; sub(/^\([0-9*]+\) /, "", name) }
+        index($0, "Device: " dev ")") { print name; exit }'
+}
+
+# --- /etc/resolver, single owner --------------------------------------------
+# POSIX sh has no local variables, so each function uses its own prefix.
+
+write_resolver() { # owner domain nameserver...
+    wr_owner="$1"
+    wr_dom="$2"
+    shift 2
+    valid_owner "$wr_owner" || return 0
+    valid_domain "$wr_dom" || return 0
+    wr_file="$RESOLVER_DIR/$wr_dom"
+    wr_reg="$REGISTRY/$wr_dom"
+    if [ -e "$wr_file" ] && [ ! -e "$wr_reg" ]; then
+        say "leaving $wr_file alone: this hook did not write it"
+        return 0
+    fi
+    if [ -e "$wr_reg" ] && [ "$(cat "$wr_reg")" != "$wr_owner" ]; then
+        say "leaving $wr_file alone: it belongs to $(cat "$wr_reg")"
+        return 0
+    fi
+    wr_lines=""
+    for wr_ns in "$@"; do
+        valid_ip "$wr_ns" && wr_lines="${wr_lines}nameserver $wr_ns
+"
+    done
+    [ -n "$wr_lines" ] || return 0
+    mkdir -p "$RESOLVER_DIR" "$REGISTRY"
+    printf '%stimeout 2\n' "$wr_lines" >"$wr_file.tmp" && chmod 0644 "$wr_file.tmp" && mv "$wr_file.tmp" "$wr_file"
+    printf '%s\n' "$wr_owner" >"$wr_reg"
+}
+
+clear_resolvers() { # owner
+    [ -d "$REGISTRY" ] || return 0
+    for cr_dom in $(ls "$REGISTRY"); do
+        [ "$(cat "$REGISTRY/$cr_dom" 2>/dev/null)" = "$1" ] || continue
+        rm -f "$RESOLVER_DIR/$cr_dom" "$REGISTRY/$cr_dom"
+    done
+}
+
+apply_file() { # owner file
+    af_owner="$1"
+    valid_owner "$af_owner" || return 0
+    [ -r "$2" ] || return 0
+    while read -r af_dom af_servers; do
+        [ -n "$af_dom" ] && [ -n "$af_servers" ] || continue
+        write_resolver "$af_owner" "$(lower "$af_dom")" $af_servers
+    done <"$2"
+}
+
+# --- routes and IPv6 -----------------------------------------------------------
+
+route_fix() { # slug interface gateway
+    rf_rec="$TUNNELS/$1/routes"
+    case "${NODENS_ROUTE_STRATEGY:-host-routes}" in
+    host-routes)
+        rf_hosts="$ETC/$1.hosts"
+        [ -r "$rf_hosts" ] || return 0
+        while read -r rf_ip; do
+            valid_ip "$rf_ip" || continue
+            grep -qx -- "-host $rf_ip" "$rf_rec" 2>/dev/null && continue
+            run route -n add -host "$rf_ip" "$3" && echo "-host $rf_ip" >>"$rf_rec"
+        done <"$rf_hosts"
+        ;;
+    scoped-default)
+        grep -qx -- "-ifscope $2 default" "$rf_rec" 2>/dev/null && return 0
+        run route -n add -ifscope "$2" default "$3" && echo "-ifscope $2 default" >>"$rf_rec"
+        ;;
+    scoped-halves)
+        for rf_net in 0.0.0.0/1 128.0.0.0/1; do
+            grep -qx -- "-ifscope $2 -net $rf_net" "$rf_rec" 2>/dev/null && continue
+            run route -n add -ifscope "$2" -net "$rf_net" "$3" && echo "-ifscope $2 -net $rf_net" >>"$rf_rec"
+        done
+        ;;
+    esac
+}
+
+ipv6_off() { # slug interface
+    i6_svc=$(service_for "$2")
+    [ -n "$i6_svc" ] || return 0
+    i6_mode=$(networksetup -getinfo "$i6_svc" | awk -F': ' '/^IPv6:/ { print $2; exit }')
+    [ "$i6_mode" = "Automatic" ] || return 0
+    run networksetup -setv6off "$i6_svc" && printf '%s\n' "$i6_svc" >"$TUNNELS/$1/ipv6-service"
+}
+
+# --- tunnel up / down ----------------------------------------------------------
+
+# Records the tunnel, then applies the route fix and the IPv6 block when the
+# tunnel takes all IPv4 traffic.
+tunnel_up() { # slug device kind
+    tu_slug="$1"
+    tu_dev="$2"
+    mkdir -p "$TUNNELS/$tu_slug"
+    printf '%s\n' "$tu_dev" >"$TUNNELS/$tu_slug/device"
+    printf '%s\n' "$3" >"$TUNNELS/$tu_slug/kind"
+    full_tunnel "$tu_dev" || return 0
+    set -- $(uplink)
+    tu_ifc="${1:-}"
+    tu_gw="${2:-}"
+    if [ -n "$tu_ifc" ] && valid_ip "$tu_gw"; then
+        say "full tunnel on $tu_dev; uplink $tu_ifc via $tu_gw; strategy ${NODENS_ROUTE_STRATEGY:-host-routes}"
+        route_fix "$tu_slug" "$tu_ifc" "$tu_gw"
+        ipv6_full_tunnel "$tu_dev" || ipv6_off "$tu_slug" "$tu_ifc"
+    else
+        say "full tunnel on $tu_dev, but no uplink default route was found"
+    fi
+}
+
+# Resolver files for the VPN's own domains. Without a domain nothing changes:
+# Nodens never replaces the default resolver.
+dns_apply() { # slug "servers" "domains"
+    say "VPN DNS servers [$2] domains [$3]"
+    [ -n "$2" ] && [ -n "$3" ] || return 0
+    for da_dom in $3; do
+        write_resolver "tunnel:$1" "$da_dom" $2
+    done
+}
+
+ovpn_up() {
+    ou_slug="${NODENS_SLUG:-}"
+    valid_slug "$ou_slug" || { say "missing or invalid NODENS_SLUG"; return 0; }
+    tunnel_up "$ou_slug" "${dev:-}" ovpn
+    servers=""
+    domains=""
+    i=1
+    while :; do
+        eval "opt=\${foreign_option_$i:-}"
+        [ -n "$opt" ] || break
+        set -- $opt
+        if [ "${1:-}" = "dhcp-option" ]; then
+            case "${2:-}" in
+            DNS) valid_ip "${3:-}" && servers="$servers $3" ;;
+            DOMAIN | DOMAIN-SEARCH) d=$(lower "${3:-}") && valid_domain "$d" && domains="$domains $d" ;;
+            esac
+        fi
+        i=$((i + 1))
+    done
+    # OpenVPN 2.7 also exports --dns options as dns_server_N_address_M / dns_search_domain_M.
+    n=0
+    while [ $n -lt 8 ]; do
+        m=1
+        while [ $m -le 8 ]; do
+            eval "a=\${dns_server_${n}_address_${m}:-}"
+            valid_ip "$a" && case " $servers " in *" $a "*) ;; *) servers="$servers $a" ;; esac
+            m=$((m + 1))
+        done
+        n=$((n + 1))
+    done
+    m=1
+    while [ $m -le 16 ]; do
+        eval "d=\${dns_search_domain_${m}:-}"
+        d=$(lower "$d")
+        valid_domain "$d" && case " $domains " in *" $d "*) ;; *) domains="$domains $d" ;; esac
+        m=$((m + 1))
+    done
+    dns_apply "$ou_slug" "${servers# }" "${domains# }"
+}
+
+wg_up() { # slug device
+    valid_slug "$1" || { say "invalid slug"; return 0; }
+    valid_device "$2" || { say "invalid device '$2'"; return 0; }
+    tunnel_up "$1" "$2" wg
+    wu_servers=""
+    for wu_s in ${NODENS_DNS_SERVERS:-}; do valid_ip "$wu_s" && wu_servers="$wu_servers $wu_s"; done
+    wu_domains=""
+    for wu_d in ${NODENS_DNS_DOMAINS:-}; do
+        wu_d=$(lower "$wu_d")
+        valid_domain "$wu_d" && wu_domains="$wu_domains $wu_d"
+    done
+    dns_apply "$1" "${wu_servers# }" "${wu_domains# }"
+}
+
+undo() { # slug
+    un_slug="$1"
+    valid_slug "$un_slug" || return 0
+    un_dir="$TUNNELS/$un_slug"
+    [ -d "$un_dir" ] || return 0
+    if [ -r "$un_dir/routes" ]; then
+        while read -r un_spec; do
+            run route -n delete $un_spec
+        done <"$un_dir/routes"
+    fi
+    if [ -r "$un_dir/ipv6-service" ]; then
+        run networksetup -setv6automatic "$(cat "$un_dir/ipv6-service")"
+    fi
+    clear_resolvers "tunnel:$un_slug"
+    # The engines read their config once at start; keys stay on disk only while
+    # a tunnel runs.
+    rm -f "$ETC/$un_slug.ovpn" "$ETC/wg/$un_slug.conf"
+    rm -rf "$un_dir"
+    say "undid the changes of $un_slug"
+}
+
+# The engine of a recorded tunnel still runs.
+tunnel_alive() { # slug
+    ta_kind=$(cat "$TUNNELS/$1/kind" 2>/dev/null)
+    if [ "$ta_kind" = wg ]; then
+        # wg-quick names the interface after the slug and writes its utun to <slug>.name.
+        ta_dev=$(cat "$TUNNELS/$1/device" 2>/dev/null)
+        [ -n "$ta_dev" ] || return 1
+        [ "$(cat "$WG_RUN/$1.name" 2>/dev/null)" = "$ta_dev" ] || return 1
+        ifconfig "$ta_dev" >/dev/null 2>&1
+        return
+    fi
+    ta_pid=$(cat "$STATE/$1.pid" 2>/dev/null)
+    [ -n "$ta_pid" ] || return 1
+    case "$(ps -p "$ta_pid" -o comm= 2>/dev/null)" in
+    *openvpn*) return 0 ;;
+    esac
+    return 1
+}
+
+cleanup_stale() {
+    [ -d "$TUNNELS" ] || return 0
+    for cs_slug in $(ls "$TUNNELS"); do
+        tunnel_alive "$cs_slug" && continue
+        undo "$cs_slug"
+    done
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+ovpn-up) ovpn_up ;;
+ovpn-down) undo "${NODENS_SLUG:-}" ;;
+wg-up) [ $# -eq 2 ] && wg_up "$1" "$2" ;;
+wg-down) undo "${1:-}" ;;
+undo) undo "${1:-}" ;;
+cleanup-stale) cleanup_stale ;;
+resolver-apply) [ $# -eq 2 ] && apply_file "$1" "$2" ;;
+resolver-clear) valid_owner "${1:-}" && clear_resolvers "$1" ;;
+*)
+    echo "usage: hook ovpn-up | ovpn-down | wg-up <slug> <utun> | wg-down <slug> | undo <slug> | cleanup-stale | resolver-apply <owner> <file> | resolver-clear <owner>" >&2
+    exit 64
+    ;;
+esac
+exit 0
