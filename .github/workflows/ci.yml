@@ -30,7 +30,7 @@ jobs:
         run: tar -czf build/Nodens.app.tar.gz -C build Nodens.app
 
       - name: Upload the app bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Nodens.app
           path: build/Nodens.app.tar.gz
